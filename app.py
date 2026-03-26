@@ -1,5 +1,7 @@
+import json
 from pathlib import Path
 
+import h5py
 import pandas as pd
 import streamlit as st
 import tensorflow as tf
@@ -15,10 +17,83 @@ SALARY_MODEL_PATH = Path("models/regression_model.h5")
 DROP_COLUMNS = ["RowNumber", "CustomerId", "Surname"]
 
 
+def _normalize_dtype(dtype_config):
+    if isinstance(dtype_config, str):
+        return dtype_config
+    if isinstance(dtype_config, dict):
+        return dtype_config.get("config", {}).get("name")
+    return None
+
+
+def _build_compatible_h5_model(model_path: Path):
+    # Keras 3.x may write H5 configs with fields that older runtimes cannot deserialize.
+    with h5py.File(model_path, "r") as model_file:
+        raw_config = model_file.attrs["model_config"]
+
+    if isinstance(raw_config, bytes):
+        raw_config = raw_config.decode("utf-8")
+
+    model_config = json.loads(raw_config)
+    sequential_config = model_config.get("config", {})
+    layer_definitions = sequential_config.get("layers", [])
+
+    input_shape = None
+    input_name = None
+    input_dtype = "float32"
+    model = tf.keras.Sequential(name=sequential_config.get("name", model_path.stem))
+
+    for layer_definition in layer_definitions:
+        class_name = layer_definition.get("class_name")
+        layer_config = layer_definition.get("config", {})
+
+        if class_name == "InputLayer":
+            batch_shape = layer_config.get("batch_shape") or layer_config.get("batch_input_shape")
+            if not batch_shape or len(batch_shape) < 2:
+                raise ValueError(f"Unsupported input shape in {model_path}.")
+
+            input_shape = tuple(dimension for dimension in batch_shape[1:] if dimension is not None)
+            input_name = layer_config.get("name")
+            input_dtype = _normalize_dtype(layer_config.get("dtype")) or input_dtype
+            continue
+
+        if class_name != "Dense":
+            raise ValueError(f"Unsupported layer '{class_name}' in {model_path}.")
+
+        if input_shape is None:
+            raise ValueError(f"Missing InputLayer metadata in {model_path}.")
+
+        dense_kwargs = {
+            "units": layer_config["units"],
+            "activation": layer_config.get("activation"),
+            "use_bias": layer_config.get("use_bias", True),
+            "name": layer_config.get("name"),
+        }
+        dense_dtype = _normalize_dtype(layer_config.get("dtype"))
+        if dense_dtype:
+            dense_kwargs["dtype"] = dense_dtype
+
+        if not model.layers:
+            model.add(tf.keras.Input(shape=input_shape, name=input_name, dtype=input_dtype))
+
+        dense_layer = tf.keras.layers.Dense(**dense_kwargs)
+        dense_layer.trainable = layer_config.get("trainable", True)
+        model.add(dense_layer)
+
+    model.load_weights(model_path)
+    return model
+
+
+def load_model_with_fallback(model_path: Path):
+    try:
+        return tf.keras.models.load_model(model_path, compile=False)
+    except (TypeError, ValueError):
+        return _build_compatible_h5_model(model_path)
+
+
 @st.cache_resource
 def load_models():
-    churn_model = tf.keras.models.load_model(CHURN_MODEL_PATH, compile=False)
-    salary_model = tf.keras.models.load_model(SALARY_MODEL_PATH, compile=False)
+    churn_model = load_model_with_fallback(CHURN_MODEL_PATH)
+    salary_model = load_model_with_fallback(SALARY_MODEL_PATH)
     return churn_model, salary_model
 
 
